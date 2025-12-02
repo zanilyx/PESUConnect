@@ -1,0 +1,479 @@
+================================================================================
+PESUConnect - File Explanations and Architecture Documentation
+================================================================================
+
+This document explains what each file does, how it works, and why it works in the
+PESUConnect application. The application is a web scraper that interfaces with
+PESU Academy to provide a better user experience for students.
+
+================================================================================
+BACKEND FILES (server/)
+================================================================================
+
+1. server/index.js
+   Purpose: Main entry point for the Express.js backend server
+   How it works:
+   - Sets up Express app with CORS, JSON parsing, and cookie parsing middleware
+   - Connects to MongoDB database using Mongoose
+   - Registers all API routes (auth, attendance, results, resources, chat, timetable)
+   - Starts the HTTP server on port 5000 (or PORT from environment)
+   - Handles MongoDB connection events (disconnect, errors)
+   Why it works:
+   - Centralized server configuration ensures all routes are accessible
+   - MongoDB connection is established before server starts, preventing race conditions
+   - CORS is configured to allow credentials from frontend (localhost:3000)
+   - Cookie parser enables session management via HTTP-only cookies
+
+2. server/middleware/auth.js
+   Purpose: Authentication middleware that protects API routes
+   How it works:
+   - Extracts JWT token from cookies, Authorization header, or x-auth-token header
+   - Verifies token using JWT_SECRET from environment
+   - Looks up user in database using userId from decoded token
+   - Attaches user object to req.user for use in route handlers
+   - Returns 401 if token is missing, invalid, or expired
+   Why it works:
+   - Single source of truth for authentication logic
+   - Supports multiple token sources (cookies for web, headers for API clients)
+   - Includes user's PESU credentials in req.user for scraping operations
+   - Prevents unauthorized access to protected routes
+
+3. server/models/User.js
+   Purpose: Mongoose schema definition for user data
+   How it works:
+   - Defines user schema with fields: srn, password, pesuUsername, pesuPassword, name
+   - Stores academic data: currentSemester, currentSection
+   - Caches scraped data: semesterCache, subjectsCache
+   - Tracks login timestamps: lastLoginAt, createdAt, updatedAt
+   - Auto-hashes passwords before saving using bcrypt
+   - Provides comparePassword method for login verification
+   Why it works:
+   - Centralized data model ensures consistency across the application
+   - Password hashing prevents storing plaintext passwords
+   - Caching reduces redundant API calls to PESU Academy
+   - Timestamps enable cache invalidation logic (7-day rule, session-based)
+
+4. server/models/Attendance.js
+   Purpose: Mongoose schema for attendance records
+   How it works:
+   - Stores attendance per user, semester, and subject
+   - Fields: userId, semester, subjectCode, subjectName, totalClasses, attendedClasses, percentage
+   - Indexed on userId and semester for fast queries
+   Why it works:
+   - Separate collection allows efficient querying of attendance data
+   - Indexes speed up lookups when fetching attendance for a semester
+   - Normalized structure prevents data duplication
+
+5. server/models/Result.js
+   Purpose: Mongoose schema for academic results
+   How it works:
+   - Stores results per user, semester, and subject
+   - Fields: userId, semester, subjectCode, subjectName, ia1, ia2, ese, total, maxMarks
+   - Indexed on userId and semester for fast queries
+   Why it works:
+   - Separate collection allows efficient querying of results
+   - Historical data is preserved (can view past semesters)
+   - Indexes enable quick lookups for GPA calculations
+
+6. server/models/Timetable.js
+   Purpose: Mongoose schema for class timetable
+   How it works:
+   - Stores timetable per user (one document per user)
+   - Fields: userId, timetable (array of class objects), updatedAt
+   - Timetable array contains objects with: day, time, subject, faculty, room, etc.
+   Why it works:
+   - Single document per user simplifies updates (no need to delete old entries)
+   - Array structure matches the scraped HTML table structure
+   - UpdatedAt timestamp enables cache validation
+
+7. server/services/pesuScraper.js
+   Purpose: Core scraping service that mimics browser requests to PESU Academy
+   How it works:
+   - Uses axios with cookie jar support (like Python's requests.Session())
+   - Creates sessions with proper User-Agent and headers matching real browser
+   - Login function: GETs login page, extracts CSRF token, POSTs credentials, validates success
+   - Provides helper functions: getCSRFToken, getAttendanceHtml, getTimetableHtml, getResultsHtml
+   - Handles cookies automatically through tough-cookie library
+   Why it works:
+   - Cookie jar maintains session state across requests (like browser cookies)
+   - Proper headers prevent PESU Academy from blocking requests as bot traffic
+   - CSRF token extraction and inclusion matches official website behavior
+   - Session reuse avoids re-authentication for multiple requests
+
+8. server/routes/auth.js
+   Purpose: Handles user registration, login, logout, and profile management
+   How it works:
+   - POST /register: Validates PESU credentials, extracts SRN and name, creates user, returns JWT
+   - POST /login: Validates credentials, extracts/updates name, sets lastLoginAt, returns JWT
+   - POST /logout: Clears authentication cookie
+   - GET /me: Returns current authenticated user's profile
+   - POST /refresh: Triggers background data refresh (semesters, subjects, attendance, timetable, results)
+   - Background refresh: After login/register, asynchronously fetches and caches all user data
+   Why it works:
+   - JWT tokens provide stateless authentication (no server-side session storage)
+   - Background refresh ensures data is ready when user navigates to different sections
+   - Name extraction from PESU profile enables displaying names in chat instead of SRNs
+   - Caching logic prevents redundant API calls (only updates if data differs or cache expired)
+
+9. server/routes/resources.js
+   Purpose: Handles fetching and downloading course resources (PDFs, slides)
+   How it works:
+   - GET /semesters/cached: Returns cached semesters from user document
+   - GET /html/semesters: Fetches semesters from PESU Academy, parses HTML dropdown
+   - POST /subjects: Fetches subjects for a semester (actionType=38), implements caching
+   - GET /units/:courseId: Fetches units for a subject (actionType=39)
+   - GET /classes/:unitId: Fetches classes for a unit (actionType=40), extracts resource counts
+   - POST /preview: Extracts document IDs from preview HTML (actionType=60 or 343 fallback)
+   - GET /download/:docId: Downloads file by document ID, extracts filename from headers
+   - Caching: Returns cached subjects immediately, fetches in background if cache expired
+   Why it works:
+   - Multi-step AJAX flow matches refo.py exactly (semesters -> subjects -> units -> classes -> preview -> download)
+   - Caching reduces load on PESU Academy servers and improves response time
+   - Background refresh ensures cache stays fresh without blocking user requests
+   - subjectsDataEqual helper prevents unnecessary database writes when data hasn't changed
+   - Document ID extraction uses regex patterns matching refo.py for reliability
+
+10. server/routes/attendance.js
+    Purpose: Handles fetching and syncing attendance data
+    How it works:
+    - GET /html/:semesterId: Returns cached attendance immediately, triggers background refresh if needed
+    - POST /sync: Fetches fresh attendance from PESU, compares with cache, only updates if different
+    - Parses HTML table to extract subject-wise attendance (attended/total classes, percentage)
+    - attendanceDataEqual helper compares old and new data to prevent redundant updates
+    Why it works:
+    - Immediate cache return provides instant user experience
+    - Background sync keeps data fresh without blocking UI
+    - Data comparison prevents unnecessary database writes
+    - Session-based cache validation (only updates if not from current login session)
+
+11. server/routes/results.js
+    Purpose: Handles fetching and syncing academic results
+    How it works:
+    - GET /:semester: Returns cached results immediately, triggers background refresh if needed
+    - POST /sync: Fetches fresh results from PESU, compares with cache, only updates if different
+    - Calculates GPA from results (weighted average)
+    - resultsDataEqual helper compares old and new data
+    - 7-day cache validity: Only fetches from PESU if cache is older than 7 days
+    Why it works:
+    - Immediate cache return shows data instantly
+    - Background sync ensures data freshness
+    - GPA calculation provides quick academic overview
+    - 7-day rule prevents excessive API calls (results don't change frequently)
+
+12. server/routes/timetable.js
+    Purpose: Handles fetching and syncing class timetable
+    How it works:
+    - GET /: Returns cached timetable immediately, triggers background refresh if needed
+    - Parses HTML table to extract class schedule (day, time, subject, faculty, room)
+    - timetableDataEqual helper compares old and new data
+    - 7-day cache validity: Only fetches if cache is older than 7 days
+    Why it works:
+    - Timetable changes infrequently, so caching is highly effective
+    - Immediate cache return provides instant display
+    - Background refresh keeps data current without blocking UI
+    - Single document per user simplifies update logic
+
+13. server/routes/chat.js
+    Purpose: Handles section-based group chat functionality
+    How it works:
+    - GET /:section: Returns messages for a section, populates sender names from database
+    - POST /:section: Creates new message with senderSrn and senderName, stores in memory
+    - For old messages without names, looks up names from User collection
+    - Messages stored in memory (chatMessages object) - in production should use MongoDB
+    Why it works:
+    - In-memory storage is simple for MVP (can be migrated to MongoDB later)
+    - Name lookup ensures backward compatibility with old messages
+    - Section-based routing allows separate chats per class section
+    - Stores both SRN and name for flexibility
+
+================================================================================
+FRONTEND FILES (client/src/)
+================================================================================
+
+14. client/src/index.js
+    Purpose: React application entry point
+    How it works:
+    - Renders App component into root DOM element
+    - Imports global CSS styles
+    Why it works:
+    - Standard React entry point pattern
+    - CSS is loaded globally for consistent styling
+
+15. client/src/index.css
+    Purpose: Global CSS styles and theme definitions
+    How it works:
+    - Defines CSS variables for light/dark themes
+    - Defines gradient themes (daybreak, sunset, ocean, forest, etc.)
+    - Styles for cards, buttons, forms, chat, tables, etc.
+    - Responsive design with media queries
+    Why it works:
+    - CSS variables enable easy theme switching
+    - Consistent design system across all components
+    - Dark mode support via data-theme attribute
+
+16. client/src/App.js
+    Purpose: Main React component that manages authentication state and routing
+    How it works:
+    - Manages user state (null = logged out, object = logged in)
+    - Checks authentication on mount (GET /api/auth/me)
+    - Manages theme and gradient state (stored in localStorage)
+    - Renders Login component if not authenticated, Dashboard if authenticated
+    - Handles login/logout callbacks
+    Why it works:
+    - Centralized auth state prevents prop drilling
+    - Theme persistence via localStorage maintains user preference
+    - Conditional rendering provides clean separation between auth and app views
+    - Token fallback (localStorage) works even if cookies are blocked
+
+17. client/src/components/Login.js
+    Purpose: Login form component
+    How it works:
+    - Form with PESU username and password fields
+    - "Remember password" checkbox (stores credentials in database)
+    - POSTs to /api/auth/login on submit
+    - Stores JWT token in localStorage as backup
+    - Triggers background refresh after successful login
+    - Calls onLogin callback with user data
+    Why it works:
+    - Simple form provides clear user experience
+    - Remember password option reduces login friction
+    - Error handling displays user-friendly messages
+    - Background refresh ensures data is ready when user navigates
+
+18. client/src/components/Dashboard.js
+    Purpose: Main dashboard that orchestrates all views and navigation
+    How it works:
+    - Manages currentView state (all, attendance, resources, results, timetable, chat, settings)
+    - Renders Sidebar for navigation
+    - Conditionally renders view components based on currentView
+    - Manages semester and section state
+    - Handles preselectedSubject for navigation from Overview to Resources
+    - Passes props to child components (user, semester, section, etc.)
+    Why it works:
+    - Single source of truth for navigation state
+    - Props drilling ensures all components have necessary data
+    - PreselectedSubject enables seamless navigation from Overview to Resources
+    - Left column shows OverviewResourcesBox when viewing Overview
+
+19. client/src/components/Sidebar.js
+    Purpose: Navigation sidebar component
+    How it works:
+    - Renders navigation buttons for each view
+    - Highlights active view
+    - Shows user info and logout button
+    - Handles view switching via onViewChange callback
+    Why it works:
+    - Clear navigation structure improves UX
+    - Active state indication helps users understand current location
+    - User info display provides context
+
+20. client/src/components/Overview.js
+    Purpose: Overview tab showing attendance and timetable in compact mode
+    How it works:
+    - Renders Attendance and Timetable components with compact=true prop
+    - Minimal component - delegates to child components
+    Why it works:
+    - Separation of concerns: Overview just orchestrates, children handle logic
+    - Compact mode provides quick glance at important data
+    - Reuses existing components (Attendance, Timetable) for consistency
+
+21. client/src/components/OverviewResourcesBox.js
+    Purpose: Compact resources box in Overview tab showing subjects from max semester
+    How it works:
+    - Fetches semesters, finds max semester number
+    - Fetches subjects for max semester
+    - Displays first 5 subjects as clickable cards
+    - On click, calls onNavigateToResources with subject data
+    - Shows loading state while fetching
+    Why it works:
+    - Provides quick access to most recent semester's subjects
+    - Click navigation pre-selects subject in Resources tab
+    - Loading state prevents confusion during data fetch
+    - Limited to 5 subjects keeps UI clean
+
+22. client/src/components/Resources.js
+    Purpose: Full resources browser and downloader
+    How it works:
+    - Multi-level navigation: Semesters -> Subjects -> Units -> Classes
+    - Fetches data at each level when selection changes
+    - Displays classes table with slides count and download buttons
+    - handleDownload: Fetches preview to get doc IDs, downloads each PDF, names file after class
+    - handleDownloadAll: Downloads all PDFs for all classes in selected unit sequentially
+    - Supports preselectedSubject prop for navigation from Overview
+    - Shows progress during bulk downloads
+    Why it works:
+    - Hierarchical navigation matches PESU Academy structure
+    - Preview step extracts document IDs (required before download)
+    - Sequential downloads prevent overwhelming browser/server
+    - Progress indicators provide user feedback
+    - Filename sanitization prevents filesystem errors
+    - PreselectedSubject enables seamless navigation flow
+
+23. client/src/components/Attendance.js
+    Purpose: Displays attendance data for selected semester
+    How it works:
+    - Fetches attendance from /api/attendance/html/:semesterId
+    - Displays subject-wise attendance (attended/total, percentage)
+    - Shows overall statistics if not in compact mode
+    - Handles loading and error states
+    - Automatically fetches when semester changes
+    Why it works:
+    - Immediate cache return provides instant display
+    - Background sync keeps data fresh
+    - Compact mode allows embedding in Overview
+    - Error handling prevents app crashes
+
+24. client/src/components/Timetable.js
+    Purpose: Displays class timetable
+    How it works:
+    - Fetches timetable from /api/timetable
+    - Renders timetable in table format (day, time, subject, faculty, room)
+    - Supports day/week view modes
+    - Compact mode shows simplified view
+    - Handles loading and error states
+    Why it works:
+    - Table format matches familiar calendar view
+    - Day/week modes provide different perspectives
+    - Compact mode fits in Overview tab
+    - Cache ensures fast loading
+
+25. client/src/components/Results.js
+    Purpose: Displays academic results and GPA
+    How it works:
+    - Fetches cached results immediately from /api/results/:semester
+    - Triggers background sync via /api/results/sync
+    - Displays results in table format (subject, IA1, IA2, ESE, Total)
+    - Shows GPA prominently
+    - Handles semester selection
+    - Silently updates if background sync returns different data
+    Why it works:
+    - Immediate cache display provides instant feedback
+    - Background sync ensures data freshness
+    - Silent update prevents jarring UI changes
+    - GPA calculation provides quick academic overview
+
+26. client/src/components/Chat.js
+    Purpose: Section-based group chat component
+    How it works:
+    - Fetches messages from /api/chat/:section on mount and when section changes
+    - Displays messages with sender names (or SRN if name unavailable)
+    - Sends messages via POST /api/chat/:section
+    - Auto-scrolls to bottom when new messages arrive
+    - Highlights user's own messages
+    - Supports compact mode for embedding
+    Why it works:
+    - Section-based routing enables separate chats per class
+    - Name display improves user experience (vs SRN)
+    - Auto-scroll ensures new messages are visible
+    - Compact mode allows embedding in Overview
+
+27. client/src/components/Settings.js
+    Purpose: User settings and profile management
+    How it works:
+    - Displays user information (SRN, name, semester, section)
+    - Allows updating semester and section
+    - Theme and gradient selection
+    - Password management (if implemented)
+    Why it works:
+    - Centralized settings location improves UX
+    - Theme persistence via localStorage
+    - Profile updates sync with backend
+
+28. client/src/hooks/useSemesterId.js
+    Purpose: Custom React hook for fetching semester ID
+    How it works:
+    - Takes semester number as input
+    - Looks up semester ID from cached semesters
+    - Returns semester ID and loading state
+    - Handles errors gracefully
+    Why it works:
+    - Reusable logic prevents code duplication
+    - Encapsulates semester ID lookup complexity
+    - Loading state prevents race conditions
+
+29. client/src/utils/pesuScraper.js
+    Purpose: Client-side utility functions (if any)
+    How it works:
+    - May contain helper functions for client-side operations
+    - Currently may be empty or contain utility functions
+    Why it works:
+    - Separation of utility functions improves code organization
+    - Reusable functions reduce duplication
+
+================================================================================
+KEY ARCHITECTURAL PATTERNS
+================================================================================
+
+1. Caching Strategy:
+   - All routes return cached data immediately if available
+   - Background refresh fetches fresh data and updates cache if different
+   - Cache validation: 7-day rule for results/timetable, session-based for subjects
+   - Data comparison prevents unnecessary database writes
+
+2. Authentication Flow:
+   - JWT tokens stored in HTTP-only cookies (primary) and localStorage (fallback)
+   - Auth middleware validates tokens on protected routes
+   - User object attached to req.user includes PESU credentials for scraping
+
+3. Scraping Pattern:
+   - Multi-step AJAX flow matches PESU Academy's internal API
+   - Session management via cookie jar (like Python requests.Session())
+   - CSRF token extraction and inclusion for POST requests
+   - Proper headers to mimic browser behavior
+
+4. Data Flow:
+   - Frontend requests data -> Backend checks cache -> Returns immediately
+   - Background: Fetch from PESU -> Compare with cache -> Update if different
+   - Frontend displays cached data, silently updates if background sync changes data
+
+5. Component Structure:
+   - App.js: Auth state management
+   - Dashboard.js: Navigation and view orchestration
+   - Individual components: Self-contained feature logic
+   - Props drilling: Data flows from parent to children
+
+6. Error Handling:
+   - Try-catch blocks in all async functions
+   - User-friendly error messages
+   - Fallback to cached data when fresh fetch fails
+   - Silent failures for background operations
+
+================================================================================
+WHY THE APPLICATION WORKS
+================================================================================
+
+1. Session Management:
+   - Cookie jar maintains authentication state across requests
+   - CSRF tokens are extracted and included in POST requests
+   - Headers match real browser behavior
+
+2. Caching:
+   - Reduces load on PESU Academy servers
+   - Provides instant user experience
+   - Background refresh keeps data fresh without blocking UI
+
+3. Data Comparison:
+   - Prevents unnecessary database writes
+   - Reduces database load
+   - Ensures cache stays in sync with actual data
+
+4. Multi-step Flow:
+   - Matches PESU Academy's internal structure exactly
+   - Each step extracts necessary IDs for next step
+   - Preview step extracts document IDs required for downloads
+
+5. Error Resilience:
+   - Fallback to cached data when fresh fetch fails
+   - Silent background failures don't affect user experience
+   - User-friendly error messages guide troubleshooting
+
+6. User Experience:
+   - Immediate cache display provides instant feedback
+   - Background sync keeps data fresh
+   - Silent updates prevent jarring UI changes
+   - Loading states provide visual feedback
+
+================================================================================
+END OF DOCUMENTATION
+================================================================================
+

@@ -1,0 +1,28 @@
+{
+  "name": "pesuconnect-server",
+  "version": "1.0.0",
+  "description": "Backend server for PESUConnect",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "nodemon index.js",
+    "test-db": "node test-connection.js",
+    "test-pesu": "node test-pesu-login.js"
+  },
+  "dependencies": {
+    "axios": "^1.6.2",
+    "axios-cookiejar-support": "^6.0.4",
+    "bcryptjs": "^2.4.3",
+    "cheerio": "^1.0.0-rc.12",
+    "cookie-parser": "^1.4.6",
+    "cors": "^2.8.5",
+    "dotenv": "^16.3.1",
+    "express": "^4.18.2",
+    "jsonwebtoken": "^9.0.2",
+    "mongoose": "^8.0.3",
+    "tough-cookie": "^6.0.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.2"
+  }
+}
