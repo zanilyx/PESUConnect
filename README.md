@@ -291,7 +291,10 @@ This application is for educational purposes only. It interfaces with PESU Acade
 
 This project is licensed under the MIT License.
 
-## 👤 Author
+## 👥 Authors
+
+- **zanilyx** - [@zanilyx](https://github.com/zanilyx) - Lead Developer & Backend Integration
+- **apatelpiyush** - [@apatelpiyush](https://github.com/apatelpiyush) - UI/UX Designer & Frontend Developer
 
 Created for PESU students to enhance their academic portal experience.
 
